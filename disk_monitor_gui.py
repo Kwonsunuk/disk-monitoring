@@ -8,6 +8,7 @@ import re
 import time
 import sys
 from datetime import datetime
+import psutil
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                             QHBoxLayout, QLabel, QFrame, QPushButton, QScrollArea)
 from PyQt5.QtCore import QTimer, Qt, QPoint
@@ -157,74 +158,78 @@ class DiskMonitor:
             return None
 
     def calculate_speed(self, disk, current_stats):
-        """전송 속도 계산 - 누적 데이터 차이로 계산"""
+        """전송 속도 계산 - psutil로 읽기/쓰기 구분"""
         current_time = time.time()
 
-        # 캐시가 있고 2초 이내면 캐시된 값 반환
+        # 캐시가 있고 1.5초 이내면 캐시된 값 반환
         if disk in self.speed_cache and disk in self.last_speed_update:
-            if current_time - self.last_speed_update[disk] < 2.0:
+            if current_time - self.last_speed_update[disk] < 1.5:
                 return self.speed_cache[disk]
 
         try:
-            # iostat으로 누적 통계만 빠르게 가져오기 (대기 없음)
-            result = subprocess.run(['iostat', '-Id', disk],
-                                  capture_output=True, text=True, check=True, timeout=1)
+            # psutil로 읽기/쓰기 바이트 가져오기
+            disk_io = psutil.disk_io_counters(perdisk=True)
 
-            lines = result.stdout.strip().split('\n')
+            if disk not in disk_io:
+                result_val = ("N/A", "N/A")
+                self.speed_cache[disk] = result_val
+                self.last_speed_update[disk] = current_time
+                return result_val
 
-            if len(lines) >= 3:
-                last_line = lines[-1].strip()
-                parts = last_line.split()
+            stats = disk_io[disk]
+            read_bytes = stats.read_bytes
+            write_bytes = stats.write_bytes
 
-                if len(parts) >= 3:
-                    try:
-                        total_mb = float(parts[2])  # 누적 MB
+            # 이전 측정값이 있으면 차이 계산
+            if disk in self.previous_stats and self.previous_stats[disk]:
+                prev_read = self.previous_stats[disk].get('read_bytes', 0)
+                prev_write = self.previous_stats[disk].get('write_bytes', 0)
+                prev_time = self.previous_stats[disk].get('timestamp', current_time)
 
-                        # 이전 측정값이 있으면 차이 계산
-                        if disk in self.previous_stats and self.previous_stats[disk]:
-                            prev_mb = self.previous_stats[disk].get('total_mb', 0)
-                            prev_time = self.previous_stats[disk].get('timestamp', current_time)
+                time_diff = current_time - prev_time
+                if time_diff > 0:
+                    read_diff = read_bytes - prev_read
+                    write_diff = write_bytes - prev_write
 
-                            time_diff = current_time - prev_time
-                            if time_diff > 0:
-                                mb_diff = total_mb - prev_mb
-                                mb_per_sec = mb_diff / time_diff
+                    read_mb_s = (read_diff / time_diff) / (1024 * 1024)
+                    write_mb_s = (write_diff / time_diff) / (1024 * 1024)
 
-                                # 이전 데이터 업데이트
-                                self.previous_stats[disk] = {
-                                    'total_mb': total_mb,
-                                    'timestamp': current_time
-                                }
+                    # 이전 데이터 업데이트
+                    self.previous_stats[disk] = {
+                        'read_bytes': read_bytes,
+                        'write_bytes': write_bytes,
+                        'timestamp': current_time
+                    }
 
-                                if mb_per_sec < 0.01:
-                                    result_val = ("유휴", "")
-                                else:
-                                    result_val = (f"{mb_per_sec:.2f} MB/s", "")
+                    # 결과 포맷
+                    if read_mb_s < 0.01:
+                        read_str = "유휴"
+                    else:
+                        read_str = f"{read_mb_s:.2f} MB/s"
 
-                                self.speed_cache[disk] = result_val
-                                self.last_speed_update[disk] = current_time
-                                return result_val
+                    if write_mb_s < 0.01:
+                        write_str = "유휴"
+                    else:
+                        write_str = f"{write_mb_s:.2f} MB/s"
 
-                        # 첫 측정이면 데이터만 저장
-                        self.previous_stats[disk] = {
-                            'total_mb': total_mb,
-                            'timestamp': current_time
-                        }
-                        result_val = ("측정 중...", "")
-                        self.speed_cache[disk] = result_val
-                        self.last_speed_update[disk] = current_time
-                        return result_val
+                    result_val = (read_str, write_str)
+                    self.speed_cache[disk] = result_val
+                    self.last_speed_update[disk] = current_time
+                    return result_val
 
-                    except (ValueError, IndexError):
-                        pass
-
-            result_val = ("0.00 MB/s", "")
+            # 첫 측정이면 데이터만 저장
+            self.previous_stats[disk] = {
+                'read_bytes': read_bytes,
+                'write_bytes': write_bytes,
+                'timestamp': current_time
+            }
+            result_val = ("측정 중...", "측정 중...")
             self.speed_cache[disk] = result_val
             self.last_speed_update[disk] = current_time
             return result_val
 
         except Exception as e:
-            result_val = ("N/A", "")
+            result_val = ("N/A", "N/A")
             self.speed_cache[disk] = result_val
             self.last_speed_update[disk] = current_time
             return result_val
@@ -295,10 +300,15 @@ class RaidGroupWidget(QFrame):
             temp_label.setStyleSheet("color: #aaaaaa; border: none;")
             info_layout.addWidget(temp_label)
 
-            io_label = QLabel(f"I/O: {read_speed}")
-            io_label.setFont(QFont("SF Pro", 10))
-            io_label.setStyleSheet("color: #aaaaaa; border: none;")
-            info_layout.addWidget(io_label)
+            read_label = QLabel(f"읽기: {read_speed}")
+            read_label.setFont(QFont("SF Pro", 10))
+            read_label.setStyleSheet("color: #aaaaaa; border: none;")
+            info_layout.addWidget(read_label)
+
+            write_label = QLabel(f"쓰기: {write_speed}")
+            write_label.setFont(QFont("SF Pro", 10))
+            write_label.setStyleSheet("color: #aaaaaa; border: none;")
+            info_layout.addWidget(write_label)
 
             info_layout.addStretch()
             disk_layout.addLayout(info_layout)
@@ -309,7 +319,8 @@ class RaidGroupWidget(QFrame):
                 'frame': disk_frame,
                 'name': name_label,
                 'temp': temp_label,
-                'io': io_label
+                'read': read_label,
+                'write': write_label
             }
 
             self.disks_container.addWidget(disk_frame)
@@ -318,7 +329,8 @@ class RaidGroupWidget(QFrame):
             widgets = self.disk_widgets[disk]
             widgets['name'].setText(f"• {info.get('name', disk)}")
             widgets['temp'].setText(f"온도: {temp}")
-            widgets['io'].setText(f"I/O: {read_speed}")
+            widgets['read'].setText(f"읽기: {read_speed}")
+            widgets['write'].setText(f"쓰기: {write_speed}")
 
 
 class CompactRaidWidget(QFrame):
@@ -383,18 +395,26 @@ class CompactRaidWidget(QFrame):
             temp_label.setFixedWidth(60)
             disk_layout.addWidget(temp_label)
 
-            # I/O 속도
-            io_label = QLabel(f"I/O: {read_speed}")
-            io_label.setFont(QFont("SF Pro", 9))
-            io_label.setStyleSheet("color: #aaaaaa; border: none;")
-            disk_layout.addWidget(io_label)
+            # 읽기 속도
+            read_label = QLabel(f"↓{read_speed}")
+            read_label.setFont(QFont("SF Pro", 9))
+            read_label.setStyleSheet("color: #4caf50; border: none;")
+            read_label.setFixedWidth(90)
+            disk_layout.addWidget(read_label)
+
+            # 쓰기 속도
+            write_label = QLabel(f"↑{write_speed}")
+            write_label.setFont(QFont("SF Pro", 9))
+            write_label.setStyleSheet("color: #ff9800; border: none;")
+            disk_layout.addWidget(write_label)
 
             disk_layout.addStretch()
 
             self.disk_labels[disk] = {
                 'name': name_label,
                 'temp': temp_label,
-                'io': io_label
+                'read': read_label,
+                'write': write_label
             }
 
             self.disks_layout.addLayout(disk_layout)
@@ -406,7 +426,8 @@ class CompactRaidWidget(QFrame):
                 name = name[:9] + "..."
             labels['name'].setText(f"• {name}")
             labels['temp'].setText(f"{temp}")
-            labels['io'].setText(f"I/O: {read_speed}")
+            labels['read'].setText(f"↓{read_speed}")
+            labels['write'].setText(f"↑{write_speed}")
 
 
 class CompactDiskWidget(QFrame):
@@ -446,11 +467,18 @@ class CompactDiskWidget(QFrame):
         self.temp_label.setFixedWidth(100)
         layout.addWidget(self.temp_label)
 
-        # I/O 속도
-        self.io_label = QLabel("I/O: -")
-        self.io_label.setFont(QFont("SF Pro", 10))
-        self.io_label.setStyleSheet("color: #ffffff; border: none;")
-        layout.addWidget(self.io_label)
+        # 읽기 속도
+        self.read_label = QLabel("↓ -")
+        self.read_label.setFont(QFont("SF Pro", 10))
+        self.read_label.setStyleSheet("color: #4caf50; border: none;")
+        self.read_label.setFixedWidth(100)
+        layout.addWidget(self.read_label)
+
+        # 쓰기 속도
+        self.write_label = QLabel("↑ -")
+        self.write_label.setFont(QFont("SF Pro", 10))
+        self.write_label.setStyleSheet("color: #ff9800; border: none;")
+        layout.addWidget(self.write_label)
 
         layout.addStretch()
 
@@ -464,7 +492,8 @@ class CompactDiskWidget(QFrame):
             self.name_label.setText(disk_name)
 
         self.temp_label.setText(f"온도: {temp}")
-        self.io_label.setText(f"I/O: {read_speed}")
+        self.read_label.setText(f"↓ {read_speed}")
+        self.write_label.setText(f"↑ {write_speed}")
 
 
 class DiskInfoWidget(QFrame):
@@ -500,20 +529,22 @@ class DiskInfoWidget(QFrame):
         self.name_label = self.create_info_label("이름: ")
         self.size_label = self.create_info_label("크기: ")
         self.temp_label = self.create_info_label("온도: ")
-        self.io_label = self.create_info_label("I/O 속도: ")
+        self.read_label = self.create_info_label("읽기 속도: ", color="#4caf50")
+        self.write_label = self.create_info_label("쓰기 속도: ", color="#ff9800")
 
         layout.addWidget(self.name_label)
         layout.addWidget(self.size_label)
         layout.addWidget(self.temp_label)
-        layout.addWidget(self.io_label)
+        layout.addWidget(self.read_label)
+        layout.addWidget(self.write_label)
 
         self.setLayout(layout)
 
-    def create_info_label(self, text):
+    def create_info_label(self, text, color="#ffffff"):
         """정보 레이블 생성"""
         label = QLabel(text)
         label.setFont(QFont("SF Pro", 12))
-        label.setStyleSheet("color: #ffffff; border: none; padding: 3px;")
+        label.setStyleSheet(f"color: {color}; border: none; padding: 3px;")
         return label
 
     def update_info(self, info, temp, read_speed, write_speed):
@@ -521,7 +552,8 @@ class DiskInfoWidget(QFrame):
         self.name_label.setText(f"이름: {info.get('name', 'Unknown')}")
         self.size_label.setText(f"크기: {info.get('size', 'Unknown')}")
         self.temp_label.setText(f"온도: {temp}")
-        self.io_label.setText(f"I/O 속도: {read_speed}")
+        self.read_label.setText(f"읽기 속도: {read_speed}")
+        self.write_label.setText(f"쓰기 속도: {write_speed}")
 
 
 class WidgetWindow(QMainWindow):
@@ -533,6 +565,7 @@ class WidgetWindow(QMainWindow):
         self.parent_window = parent
         self.disk_labels = {}
         self.raid_groups = {}  # RAID 그룹 위젯 저장
+        self.drag_position = None  # 드래그 위치 저장
         self.init_ui()
         self.setup_timer()
 
@@ -680,15 +713,10 @@ class WidgetWindow(QMainWindow):
                 if len(name) > 10:
                     name = name[:7] + "..."
 
-                # I/O 속도 표시 (빈 문자열이면 표시 안함)
-                if read_speed:
-                    self.raid_groups[raid_key]['disks'][disk].setText(
-                        f"  • {name}: {temp} I/O: {read_speed}"
-                    )
-                else:
-                    self.raid_groups[raid_key]['disks'][disk].setText(
-                        f"  • {name}: {temp}"
-                    )
+                # 읽기/쓰기 속도 표시
+                self.raid_groups[raid_key]['disks'][disk].setText(
+                    f"  • {name}: {temp} ↓{read_speed} ↑{write_speed}"
+                )
 
         # 독립 디스크 처리
         for disk in grouped_disks['standalone']:
@@ -710,11 +738,8 @@ class WidgetWindow(QMainWindow):
             if len(name) > 10:
                 name = name[:7] + "..."
 
-            # I/O 속도 표시
-            if read_speed:
-                self.disk_labels[disk].setText(f"{name}: {temp} I/O: {read_speed}")
-            else:
-                self.disk_labels[disk].setText(f"{name}: {temp}")
+            # 읽기/쓰기 속도 표시
+            self.disk_labels[disk].setText(f"{name}: {temp} ↓{read_speed} ↑{write_speed}")
 
         # 창 크기 조정 (첫 초기화 시에만)
         if not hasattr(self, '_initialized'):
@@ -726,6 +751,23 @@ class WidgetWindow(QMainWindow):
         if self.parent_window:
             self.parent_window.show()
             self.close()
+
+    def mousePressEvent(self, event):
+        """마우스 클릭 이벤트 - 드래그 시작"""
+        if event.button() == Qt.LeftButton:
+            self.drag_position = event.globalPos() - self.frameGeometry().topLeft()
+            event.accept()
+
+    def mouseMoveEvent(self, event):
+        """마우스 이동 이벤트 - 창 드래그"""
+        if event.buttons() == Qt.LeftButton and self.drag_position is not None:
+            self.move(event.globalPos() - self.drag_position)
+            event.accept()
+
+    def mouseReleaseEvent(self, event):
+        """마우스 릴리즈 이벤트 - 드래그 종료"""
+        self.drag_position = None
+        event.accept()
 
 
 class MainWindow(QMainWindow):
